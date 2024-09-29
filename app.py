@@ -40,12 +40,12 @@ class ImageConverter(QWidget):
         layout.addWidget(self.output_button)
 
         # Input for quality selection
-        self.quality_label = QLabel('Enter WebP Quality (1-100): 89', self)
+        self.quality_label = QLabel('Enter WebP Quality (1-100): 87', self)
         layout.addWidget(self.quality_label)
 
         self.quality_slider = QSlider(Qt.Horizontal, self)
         self.quality_slider.setRange(1, 100)
-        self.quality_slider.setValue(89)  # Default quality
+        self.quality_slider.setValue(87)  # Default quality
         layout.addWidget(self.quality_slider)
         self.quality_slider.valueChanged.connect(self.update_quality_label)
 
