@@ -92,6 +92,8 @@ class ImageConverter(QWidget):
             QMessageBox.warning(self, 'Error', 'Please select an output directory.')
             return
 
+        self.convert_button.setEnabled(False)
+
         if self.checkbox.isChecked():
             self.convert_images_to_webp_with_metadata(self.file_paths, self.output_dir, quality)
         else:
@@ -142,6 +144,8 @@ class ImageConverter(QWidget):
 
         # reset the label
         self.file_label.setText('Select Images to Convert:')
+        # reset button
+        self.convert_button.setEnabled(True)
 
     def convert_images_to_webp_with_metadata(self, file_paths, output_dir, quality):
         renamed_files = []  # List to keep track of renamed files
@@ -214,6 +218,10 @@ class ImageConverter(QWidget):
             QMessageBox.information(self, 'Process Completed',
                                     f'Converted {len(success)} image(s).')
 
+        # reset the label
+        self.file_label.setText('Select Images to Convert:')
+        # reset button
+        self.convert_button.setEnabled(True)
 
 if __name__ == '__main__':
     app = QApplication([])
