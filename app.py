@@ -92,6 +92,7 @@ class ImageConverter(QWidget):
             QMessageBox.warning(self, 'Error', 'Please select an output directory.')
             return
 
+        # disable covert button while converting
         self.convert_button.setEnabled(False)
 
         if self.checkbox.isChecked():
@@ -144,7 +145,7 @@ class ImageConverter(QWidget):
 
         # reset the label
         self.file_label.setText('Select Images to Convert:')
-        # reset button
+        # reset covert button
         self.convert_button.setEnabled(True)
 
     def convert_images_to_webp_with_metadata(self, file_paths, output_dir, quality):
@@ -193,8 +194,8 @@ class ImageConverter(QWidget):
                         user_comment = dict_of_info.get("workflow", "")
                         img_exif[0x010e] = "Workflow:" + user_comment
                         img.convert("RGB").save(output_path, lossless=False,
-                                               quality=quality, webp_method=6,
-                                               exif=img_exif)
+                                                quality=quality, webp_method=6,
+                                                exif=img_exif)
                         success.append(output_path)
                     except Exception as e:
                         print(e)
@@ -220,8 +221,9 @@ class ImageConverter(QWidget):
 
         # reset the label
         self.file_label.setText('Select Images to Convert:')
-        # reset button
+        # reset covert button
         self.convert_button.setEnabled(True)
+
 
 if __name__ == '__main__':
     app = QApplication([])
