@@ -1,232 +1,397 @@
-import json
 import os
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QSlider, QWidget,
-                             QVBoxLayout, QPushButton, QLabel, QFileDialog, QMessageBox)
-from PyQt5.QtCore import Qt
+import json
+import time
+import threading
 from PIL import Image
 
+from PyQt5.QtCore import (
+    Qt, QObject, QRunnable, QThreadPool,
+    pyqtSignal, QSettings
+)
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QMessageBox,
+    QCheckBox, QSlider, QProgressBar, QSpinBox
+)
+
+def safe_remove(path, retries=3):
+    for _ in range(retries):
+        try:
+            os.remove(path)
+            return
+        except PermissionError:
+            time.sleep(0.1)
+    os.remove(path)
+# =========================
+# Worker Task
+# =========================
+
+class ConvertTask(QRunnable):
+
+    def __init__(self, controller, img_path):
+        super().__init__()
+        self.controller = controller
+        self.img_path = img_path
+
+    def run(self):
+        ctrl = self.controller
+
+        # Pause handling
+        with ctrl.pause_cond:
+            while ctrl.paused:
+                ctrl.pause_cond.wait()
+
+        # Cancel check AFTER pause
+        if ctrl.cancelled:
+            return
+
+        webp_size = 0  # ensures safe scope
+
+        try:
+            orig_size = os.path.getsize(self.img_path)
+
+            with Image.open(self.img_path) as img:
+                img.load()  # 🔑 required on Windows
+
+                base = os.path.splitext(os.path.basename(self.img_path))[0]
+                output_path = ctrl.resolve_name(base)
+
+                if ctrl.keep_metadata:
+                    ctrl.save_with_metadata(img, self.img_path, output_path)
+                else:
+                    img.save(output_path, "webp", quality=ctrl.quality)
+
+            # ⬅ image file is FULLY CLOSED here
+
+            webp_size = os.path.getsize(output_path)
+            if webp_size <= 0:
+                raise RuntimeError("Empty WEBP")
+
+            if ctrl.delete_originals:
+                safe_remove(self.img_path)
+
+            ctrl.task_finished(orig_size, webp_size)
+
+        except Exception as e:
+            ctrl.task_error(f"{os.path.basename(self.img_path)} → {e}")
+
+# =========================
+# Controller
+# =========================
+
+class JobController(QObject):
+    progress = pyqtSignal(int)
+    eta = pyqtSignal(str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, files, output_dir, quality,
+                 keep_metadata, delete_originals, max_workers):
+        super().__init__()
+
+        self.files = files
+        self.output_dir = output_dir
+        self.quality = quality
+        self.keep_metadata = keep_metadata
+        self.delete_originals = delete_originals
+
+        self.pool = QThreadPool.globalInstance()
+        self.pool.setMaxThreadCount(max_workers)
+
+        self.total = len(files)
+        self.completed = 0
+        self.orig_bytes = 0
+        self.webp_bytes = 0
+
+        self.start_time = time.monotonic()
+
+        self.cancelled = False
+        self.paused = False
+        self.pause_cond = threading.Condition()
+
+    def start(self):
+        for f in self.files:
+            if self.cancelled:
+                break
+            self.pool.start(ConvertTask(self, f))
+
+    def pause(self):
+        with self.pause_cond:
+            self.paused = True
+
+    def resume(self):
+        with self.pause_cond:
+            self.paused = False
+            self.pause_cond.notify_all()
+
+    def cancel(self):
+        self.cancelled = True
+
+    def resolve_name(self, base):
+        path = os.path.join(self.output_dir, f"{base}.webp")
+        i = 1
+        while os.path.exists(path):
+            path = os.path.join(self.output_dir, f"{base}_{i}.webp")
+            i += 1
+        return path
+
+    def save_with_metadata(self, img, img_path, output_path):
+        if not img_path.lower().endswith(".png"):
+            raise ValueError("Workflow requires PNG")
+
+        info = img.info.copy()
+        workflow = info.get("workflow")
+
+        if workflow:
+            try:
+                data = json.loads(workflow)
+                data["nodes"] = [
+                    n for n in data.get("nodes", [])
+                    if n.get("type") != "LoraInfo"
+                ]
+                workflow = json.dumps(data)
+            except Exception:
+                pass
+
+        exif = img.getexif()
+        if workflow:
+            exif[0x010e] = "Workflow:" + workflow
+
+        img.convert("RGB").save(
+            output_path, "webp",
+            quality=self.quality,
+            method=6,
+            exif=exif
+        )
+
+    def task_finished(self, orig, webp):
+        self.completed += 1
+        self.orig_bytes += orig
+        self.webp_bytes += webp
+
+        percent = int((self.completed / self.total) * 100)
+        self.progress.emit(percent)
+
+        elapsed = time.monotonic() - self.start_time
+        rate = self.completed / elapsed if elapsed else 0
+        remaining = self.total - self.completed
+        eta = remaining / rate if rate else 0
+
+        self.eta.emit(time.strftime("%H:%M:%S", time.gmtime(eta)))
+
+        if self.completed == self.total:
+            self.finished.emit({
+                "converted": self.completed,
+                "saved_bytes": self.orig_bytes - self.webp_bytes
+            })
+
+    def task_error(self, msg):
+        self.error.emit(msg)
+
+
+# =========================
+# UI
+# =========================
 
 class ImageConverter(QWidget):
+
+    def update_start_state(self):
+        ready = (
+            hasattr(self, "files") and self.files and
+            hasattr(self, "output_dir") and self.output_dir
+        )
+        self.btn_start.setEnabled(bool(ready))
+
     def __init__(self):
         super().__init__()
-        self.initUI()
+        self.settings = QSettings("WebPTool", "ImageConverter")
+        self.setWindowTitle("Image → WebP Converter")
+        self.setGeometry(800, 400, 480, 360)
+        self._build_ui()
+        self._load_settings()
 
-    def initUI(self):
-        self.setWindowTitle('Image to WebP Converter')
-        self.setGeometry(800, 400, 400, 200)
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
 
-        layout = QVBoxLayout()
+        self.btn_pause = QPushButton("Pause")
+        self.btn_resume = QPushButton("Resume")
+        self.btn_cancel = QPushButton("Cancel")
 
-        # Add check box
-        self.checkbox = QCheckBox('Keep ComfyUI workflow', self)
-        layout.addWidget(self.checkbox)
+        self.btn_pause.setEnabled(False)
+        self.btn_resume.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+        self.input_label = QLabel("Input folder: —")
+        self.output_label = QLabel("Output folder: —")
+        
 
-        # Label for file selection
-        self.file_label = QLabel('Select Images to Convert:', self)
-        layout.addWidget(self.file_label)
+        self.keep_metadata = QCheckBox("Preserve ComfyUI workflow (PNG)")
+        self.delete_originals = QCheckBox("Delete originals")
 
-        # Button for file selection
-        self.file_button = QPushButton('Browse Images', self)
-        self.file_button.clicked.connect(self.select_images)
-        layout.addWidget(self.file_button)
-
-        # Output directory selection
-        self.output_label = QLabel('Select Output Directory:', self)
+        self.label = QLabel("No images selected")
+        layout.addWidget(self.input_label)
         layout.addWidget(self.output_label)
+        layout.addWidget(QLabel("\n"))
+        self.eta_label = QLabel("ETA: --:--:--")
 
-        # Button for output directory selection
-        self.output_button = QPushButton('Browse Output Directory', self)
-        self.output_button.clicked.connect(self.select_output_directory)
-        layout.addWidget(self.output_button)
+        self.quality_label = QLabel("Quality: 87")
 
-        # Input for quality selection
-        self.quality_label = QLabel('Enter WebP Quality (1-100): 87', self)
-        layout.addWidget(self.quality_label)
-
-        self.quality_slider = QSlider(Qt.Horizontal, self)
+        self.quality_slider = QSlider(Qt.Horizontal)
         self.quality_slider.setRange(1, 100)
-        self.quality_slider.setValue(87)  # Default quality
+        self.quality_slider.setValue(87)
+
+        self.quality_slider.valueChanged.connect(
+            lambda v: self.quality_label.setText(f"Quality: {v}")
+        )
+
+
+        self.workers = QSpinBox()
+        self.workers.setRange(1, os.cpu_count() or 1)
+
+        self.progress = QProgressBar()
+
+        self.btn_files = QPushButton("Select Images")
+        self.btn_output = QPushButton("Select Output")
+        self.btn_start = QPushButton("Start")
+        self.btn_start.setEnabled(False)
+
+
+
+        layout.addWidget(self.keep_metadata)
+        layout.addWidget(self.delete_originals)
+        layout.addWidget(QLabel("\n"))
+        layout.addWidget(self.quality_label)
         layout.addWidget(self.quality_slider)
-        self.quality_slider.valueChanged.connect(self.update_quality_label)
+        layout.addWidget(QLabel("Parallel workers"))
+        layout.addWidget(self.workers)
+        layout.addWidget(self.label)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.eta_label)
 
-        # Convert button
-        self.convert_button = QPushButton('Convert to WebP', self)
-        self.convert_button.clicked.connect(self.convert_images)
-        layout.addWidget(self.convert_button)
+        btns = QHBoxLayout()
+        for b in (self.btn_files, self.btn_output, self.btn_start,
+                  self.btn_pause, self.btn_resume, self.btn_cancel):
+            btns.addWidget(b)
+        layout.addLayout(btns)
 
-        self.setLayout(layout)
+        self.btn_files.clicked.connect(self.select_files)
+        self.btn_output.clicked.connect(self.select_output)
+        self.btn_start.clicked.connect(self.start)
+        
+        self.btn_cancel.clicked.connect(self.cancel)
+        self.btn_pause.clicked.connect(self.pause)
+        self.btn_resume.clicked.connect(self.resume)
+        
 
-    def update_quality_label(self):
-        current_value = self.quality_slider.value()
-        self.quality_label.setText(f'Enter WebP Quality (1-100): {current_value}')
+    def _load_settings(self):
+        self.quality_slider.setValue(self.settings.value("quality", 87, int))
+        self.workers.setValue(self.settings.value("workers", max(1, (os.cpu_count() or 2) - 1), int))
+        self.keep_metadata.setChecked(self.settings.value("keep_meta", False, bool))
+        self.delete_originals.setChecked(self.settings.value("delete", False, bool))
 
-    def select_images(self):
-        options = QFileDialog.Options()
-        options |= QFileDialog.ReadOnly
-        self.file_paths, _ = QFileDialog.getOpenFileNames(self, 'Select Images', '',
-                                                          'Image Files (*.png *.jpg *.jpeg *.bmp *.tiff)',
-                                                          options=options)
-        if self.file_paths:
-            self.file_label.setText(f'Selected {len(self.file_paths)} image(s)')
+    def closeEvent(self, e):
+        self.settings.setValue("quality", self.quality_slider.value())
+        self.settings.setValue("workers", self.workers.value())
+        self.settings.setValue("keep_meta", self.keep_metadata.isChecked())
+        self.settings.setValue("delete", self.delete_originals.isChecked())
+        super().closeEvent(e)
 
-    def select_output_directory(self):
-        self.output_dir = QFileDialog.getExistingDirectory(self, 'Select Output Directory')
-        if self.output_dir:
-            self.output_label.setText(f'Selected Output Directory: {self.output_dir}')
+    def select_files(self):
+        self.files, _ = QFileDialog.getOpenFileNames(
+            self, "Images", "", "Images (*.png *.jpg *.jpeg *.bmp *.tiff)"
+        )
+        self.label.setText(f"{len(self.files)} images")
+        if self.files:
+            input_dir = os.path.dirname(self.files[0])
+            self.input_label.setText(f"Input folder: {input_dir}")
 
-    def convert_images(self):
-        # Get quality input and validate
-        try:
-            quality = self.quality_slider.value()
-            if quality < 1 or quality > 100:
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(self, 'Error', 'Please enter a valid quality between 1 and 100.')
-            return
-
-        if not hasattr(self, 'file_paths') or not self.file_paths:
-            QMessageBox.warning(self, 'Error', 'Please select at least one image file.')
-            return
-
-        if not hasattr(self, 'output_dir') or not self.output_dir:
-            QMessageBox.warning(self, 'Error', 'Please select an output directory.')
-            return
-
-        # disable covert button while converting
-        self.convert_button.setEnabled(False)
-
-        if self.checkbox.isChecked():
-            self.convert_images_to_webp_with_metadata(self.file_paths, self.output_dir, quality)
-        else:
-            self.convert_images_to_webp(self.file_paths, self.output_dir, quality)
-
-    def convert_images_to_webp(self, file_paths, output_dir, quality):
-        renamed_files = []  # List to keep track of renamed files
-        success = []
-
-        for img_path in file_paths:
-            try:
-                img = Image.open(img_path)
-                filename = os.path.basename(img_path)
-                output_filename = os.path.splitext(filename)[0] + '.webp'
-                output_path = os.path.join(output_dir, output_filename)
-
-                # Check if file already exists
-                if os.path.exists(output_path):
-                    base_name = os.path.splitext(output_filename)[0]
-                    counter = 1
-                    # Find a new name by appending a number if it already exists
-                    while os.path.exists(output_path):
-                        output_filename = f"{base_name}_{counter}.webp"
-                        output_path = os.path.join(output_dir, output_filename)
-                        counter += 1
-
-                    # Keep track of renamed files
-                    renamed_files.append(f"{filename} -> {output_filename}")
-
-                # Save the image as WebP
-                img.save(output_path, 'webp', quality=quality)
-                success.append(output_path)
-
-            except Exception as e:
-                QMessageBox.warning(self, 'Error', f'Failed to convert {filename}: {e}')
-                continue
-
-        # Prepare the message to show to the user
-        if renamed_files:
-            renamed_files_message = "\n".join(renamed_files)
-            QMessageBox.information(self, 'Process Completed',
-                                    f'Converted {len(file_paths)} image(s).\nThe output directory contained files '
-                                    f'with identical names. \nThe following converted files have been renamed:\n'
-                                    f'{renamed_files_message}')
-        else:
-            QMessageBox.information(self, 'Process Completed',
-                                    f'Converted {len(success)} image(s).')
-
-        # reset the label
-        self.file_label.setText('Select Images to Convert:')
-        # reset covert button
-        self.convert_button.setEnabled(True)
-
-    def convert_images_to_webp_with_metadata(self, file_paths, output_dir, quality):
-        renamed_files = []  # List to keep track of renamed files
-        success = []
-
-        for img_path in file_paths:
-            try:
-                img = Image.open(img_path)
-                filename = os.path.basename(img_path)
-                output_filename = os.path.splitext(filename)[0] + '.webp'
-                output_path = os.path.join(output_dir, output_filename)
-
-                # Check if file already exists
-                if os.path.exists(output_path):
-                    base_name = os.path.splitext(output_filename)[0]
-                    counter = 1
-                    # Find a new name by appending a number if it already exists
-                    while os.path.exists(output_path):
-                        output_filename = f"{base_name}_{counter}.webp"
-                        output_path = os.path.join(output_dir, output_filename)
-                        counter += 1
-
-                    # Keep track of renamed files
-                    renamed_files.append(f"{filename} -> {output_filename}")
-
-                # Saving
-                if filename.lower().endswith(".png"):
-                    # get info
-                    try:
-                        dict_of_info = img.info.copy()
-                        # Remove nodes that may cause problems
-                        try:
-                            c = json.loads(dict_of_info.get("workflow"))
-                            nodes: list = c.get('nodes')
-                            for n in nodes:
-                                if n['type'] == 'LoraInfo':
-                                    nodes.remove(n)
-                            dict_of_info['workflow'] = json.dumps(c)
-                        except Exception as e:
-                            print(e)
-                            pass
-
-                        # Saving
-                        img_exif = img.getexif()
-                        user_comment = dict_of_info.get("workflow", "")
-                        img_exif[0x010e] = "Workflow:" + user_comment
-                        img.convert("RGB").save(output_path, lossless=False,
-                                                quality=quality, webp_method=6,
-                                                exif=img_exif)
-                        success.append(output_path)
-                    except Exception as e:
-                        print(e)
-                else:
-                    QMessageBox.warning(self, 'Error', f'Failed to convert {filename} with ComfyUi workflow.\n'
-                                                       f'consider using png files with workflow or uncheck keep '
-                                                       f'ComfyUI workflow')
-
-            except Exception as e:
-                QMessageBox.warning(self, 'Error', f'Failed to convert {filename} \nWith ComfyUi workflow: {e} ')
-                continue
-
-        # Prepare the message to show to the user
-        if renamed_files:
-            renamed_files_message = "\n".join(renamed_files)
-            QMessageBox.information(self, 'Process Completed',
-                                    f'Converted {len(file_paths)} image(s).\nThe output directory contained files '
-                                    f'with identical names. \nThe following converted files have been renamed:\n'
-                                    f'{renamed_files_message}')
-        else:
-            QMessageBox.information(self, 'Process Completed',
-                                    f'Converted {len(success)} image(s).')
-
-        # reset the label
-        self.file_label.setText('Select Images to Convert:')
-        # reset covert button
-        self.convert_button.setEnabled(True)
+            self.output_dir = input_dir
+            self.output_label.setText(f"Output folder: {self.output_dir}")
+        self.update_start_state()
 
 
-if __name__ == '__main__':
+
+    def select_output(self):
+        self.output_dir = QFileDialog.getExistingDirectory(self, "Output directory")
+        self.output_label.setText(f"Output folder: {self.output_dir}")
+        self.update_start_state()
+
+
+
+        self.btn_pause.clicked.connect(self.pause)
+        self.btn_resume.clicked.connect(self.resume)
+        self.btn_cancel.clicked.connect(self.cancel)
+
+    def start(self):
+        self.ctrl = JobController(
+            self.files,
+            self.output_dir,
+            self.quality_slider.value(),
+            self.keep_metadata.isChecked(),
+            self.delete_originals.isChecked(),
+            self.workers.value()
+        )
+
+        self.btn_pause.setEnabled(True)
+        self.btn_cancel.setEnabled(True)
+        self.btn_resume.setEnabled(False)
+
+
+        self.btn_files.setEnabled(False)
+        self.btn_output.setEnabled(False)
+        self.ctrl.progress.connect(self.progress.setValue)
+        self.ctrl.eta.connect(lambda s: self.eta_label.setText(f"ETA: {s}"))
+        self.ctrl.error.connect(lambda m: QMessageBox.warning(self, "Error", m))
+        self.ctrl.finished.connect(self.done)
+
+        self.ctrl.start()
+        self.btn_start.setEnabled(False)
+    
+
+    def cancel(self):
+        if hasattr(self, "ctrl"):
+            self.ctrl.cancel()
+            self.btn_pause.setEnabled(False)
+            self.btn_resume.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+            self.btn_files.setEnabled(True)
+            self.btn_output.setEnabled(True)
+            self.update_start_state()    
+    
+    def pause(self):
+        if hasattr(self, "ctrl"):
+            self.ctrl.pause()
+            self.btn_pause.setEnabled(False)
+            self.btn_resume.setEnabled(True)
+
+    def resume(self):
+        if hasattr(self, "ctrl"):
+            self.ctrl.resume()
+            self.btn_pause.setEnabled(True)
+            self.btn_resume.setEnabled(False)
+
+
+
+    def done(self, stats):
+        saved_gb = round(stats["saved_bytes"] / (1024 ** 3), 2)
+        QMessageBox.information(self, "Done", f"Saved: {saved_gb} GB")
+
+        self.btn_pause.setEnabled(False)
+        self.btn_resume.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+        self.update_start_state()
+        self.btn_files.setEnabled(True)
+        self.btn_output.setEnabled(True)
+
+
+
+
+
+# =========================
+# Entry
+# =========================
+
+if __name__ == "__main__":
     app = QApplication([])
-    window = ImageConverter()
-    window.show()
+    w = ImageConverter()
+    w.show()
     app.exec_()
