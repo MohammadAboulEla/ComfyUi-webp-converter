@@ -246,7 +246,7 @@ class ImageConverter(QWidget):
         # --- 2. Options (Checkboxes) ---
         opts_layout = QHBoxLayout()
         self.keep_metadata = QCheckBox("Preserve ComfyUI workflow")
-        self.delete_originals = QCheckBox("Delete originals")
+        self.delete_originals = QCheckBox("Delete original images after conversion")
         opts_layout.addWidget(self.keep_metadata)
         opts_layout.addWidget(self.delete_originals)
         opts_layout.addStretch()
