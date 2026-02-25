@@ -1,0 +1,14 @@
+# IDE
+.idea/
+shelf/
+workspace.xml
+
+# Virtual environments (root + all subfolders)
+venv/
+.venv/
+env/
+ENV/
+**/venv/
+**/.venv/
+**/env/
+**/ENV/
